@@ -1,0 +1,211 @@
+# Builds the FiberView installers and attaches them to a GitHub release.
+#
+#   Push a tag v1.2.3              -> release "FiberView 1.2.3" with
+#                                       FiberView-1.2.3-Windows-setup.exe
+#                                       FiberView-1.2.3-macOS-AppleSilicon.pkg
+#                                       FiberView-1.2.3-macOS-Intel.pkg
+#                                       FiberView-1.2.3-Arduino.zip
+#   Actions -> Build installers -> Run workflow
+#       version "1.2.3"            -> same as above; the tag v1.2.3 is created by the workflow
+#       version box empty          -> build and test only (installers kept as artifacts of the run)
+#
+# Every built app runs its self-test on synthetic data before it is packaged, and every installer is
+# installed on the build machine and self-tested again, so a broken installer is never released.
+
+name: Build installers
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 1.2.3 (creates tag v1.2.3). Leave empty to only build and test."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-installers-${{ github.ref }}-${{ github.event.inputs.version || 'none' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      numeric: ${{ steps.v.outputs.numeric }}
+      release: ${{ steps.v.outputs.release }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Decide the version
+        id: v
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: python install/ci_version.py
+      - name: Arduino sketch zip
+        run: |
+          mkdir -p out
+          cd arduino && zip -r "../out/FiberView-${{ steps.v.outputs.version }}-Arduino.zip" README.md fiberview_ads1115
+          unzip -l "../out/FiberView-${{ steps.v.outputs.version }}-Arduino.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arduino
+          path: out/*.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows installer
+    needs: prepare
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      FIBERVIEW_VERSION_NUMERIC: ${{ needs.prepare.outputs.numeric }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Write the version
+        run: python install/ci_version.py --write "$env:VERSION"
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r install/requirements-build.txt
+      - name: Build the app (PyInstaller)
+        run: python -m PyInstaller --noconfirm --distpath dist --workpath build install/fiberview.spec
+      - name: Self-test of the built app
+        run: |
+          $log = Join-Path $pwd "selftest.txt"
+          $p = Start-Process -FilePath "dist\FiberView\FiberView.exe" -ArgumentList "--self-test", "`"$log`"" -Wait -PassThru
+          Get-Content $log
+          if ($p.ExitCode -ne 0) { throw "Self-test failed (exit code $($p.ExitCode))" }
+      - name: Build the installer (Inno Setup)
+        run: |
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          & $iscc "/DMyAppVersion=$env:VERSION" "/DMyAppNumeric=$env:FIBERVIEW_VERSION_NUMERIC" install\windows_installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+          Get-ChildItem dist\*.exe
+      - name: Install silently and self-test the installed app
+        run: |
+          $setup = (Get-ChildItem "dist\FiberView-$env:VERSION-Windows-setup.exe").FullName
+          $dir = Join-Path $env:RUNNER_TEMP "FiberView-install-test"
+          $p = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/DIR=`"$dir`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Setup failed (exit code $($p.ExitCode))" }
+          $log = Join-Path $env:RUNNER_TEMP "selftest-installed.txt"
+          $p = Start-Process -FilePath "$dir\FiberView.exe" -ArgumentList "--self-test", "`"$log`"" -Wait -PassThru
+          Get-Content $log
+          if ($p.ExitCode -ne 0) { throw "Self-test of the installed app failed" }
+          $p = Start-Process -FilePath "$dir\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          Write-Host "Uninstaller exit code $($p.ExitCode)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/FiberView-*-Windows-setup.exe
+          if-no-files-found: error
+
+  mac:
+    name: Mac installer (${{ matrix.label }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: AppleSilicon
+            runner: macos-15          # Apple silicon (arm64)
+            hostarch: arm64
+          - label: Intel
+            runner: macos-15-intel    # Intel (x86_64); this package also installs on Apple silicon (Rosetta)
+            hostarch: x86_64,arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      FIBERVIEW_VERSION_NUMERIC: ${{ needs.prepare.outputs.numeric }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Write the version
+        run: python install/ci_version.py --write "$VERSION"
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r install/requirements-build.txt
+      - name: Build the app (PyInstaller)
+        run: python -m PyInstaller --noconfirm --distpath dist --workpath build install/fiberview.spec
+      - name: Self-test of the built app
+        run: |
+          uname -m
+          lipo -archs dist/FiberView.app/Contents/MacOS/FiberView
+          set +e
+          dist/FiberView.app/Contents/MacOS/FiberView --self-test "$PWD/selftest.txt"; rc=$?
+          set -e
+          cat selftest.txt
+          exit $rc
+      - name: Build the installer package
+        run: bash install/make_pkg.sh "$VERSION" "${{ matrix.label }}" "${{ matrix.hostarch }}"
+      - name: Install the package and self-test the installed app
+        run: |
+          sudo installer -pkg "dist/FiberView-$VERSION-macOS-${{ matrix.label }}.pkg" -target /
+          ls -ld /Applications/FiberView.app
+          /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" /Applications/FiberView.app/Contents/Info.plist
+          set +e
+          /Applications/FiberView.app/Contents/MacOS/FiberView --self-test "$RUNNER_TEMP/selftest-installed.txt"; rc=$?
+          set -e
+          cat "$RUNNER_TEMP/selftest-installed.txt"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.label }}
+          path: dist/FiberView-*-macOS-${{ matrix.label }}.pkg
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: [prepare, windows, mac]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Check the files
+        run: |
+          ls -la out
+          for f in "FiberView-$VERSION-Windows-setup.exe" "FiberView-$VERSION-macOS-AppleSilicon.pkg" \
+                   "FiberView-$VERSION-macOS-Intel.pkg" "FiberView-$VERSION-Arduino.zip"; do
+            test -s "out/$f" || { echo "::error::missing $f"; exit 1; }
+          done
+      - name: Release notes
+        run: python3 install/release_notes.py "$VERSION" > notes.md
+      - name: Create the release (and the tag, when started from Run workflow)
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists - replacing its files"
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* --title "FiberView $VERSION" --notes-file notes.md --target "$GITHUB_SHA"
+          fi
+          gh release view "$TAG" --json url,assets --jq '.url, (.assets[].name)'

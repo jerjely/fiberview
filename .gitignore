@@ -1,0 +1,36 @@
+# Python / build output
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# recordings, data and results - never commit these
+*.npz
+*.npy
+*.meta.json
+*.signal.f32
+*.time.f64
+*.sync.f32
+*_dFF.csv
+*_dFF.png
+*_sync_events.csv
+*_sync_aligned.csv
+data/
+recordings/
+results/
+FiberView data/
+
+# logs and test output
+*.log
+selftest*.txt
+notes.md
+
+# OS / editors
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
